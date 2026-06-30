@@ -1,0 +1,70 @@
+include /etc/nginx/conf.d/auth-active.conf;
+include /etc/nginx/conf.d/posts-active.conf;
+include /etc/nginx/conf.d/comments-active.conf;
+include /etc/nginx/conf.d/media-active.conf;
+include /etc/nginx/conf.d/notification-worker-active.conf;
+
+server {
+    listen 80;
+    server_name _;
+    client_max_body_size 12M;
+
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+
+    location /nginx-health {
+        return 200 'gateway ok\n';
+        add_header Content-Type text/plain;
+    }
+
+    location /api/auth/ {
+        rewrite ^/api/auth/(.*) /$1 break;
+        proxy_pass http://auth_active;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+        proxy_next_upstream error timeout http_502 http_503;
+    }
+
+    location /api/posts/ {
+        rewrite ^/api/posts/(.*) /$1 break;
+        proxy_pass http://posts_active;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+        proxy_next_upstream error timeout http_502 http_503;
+    }
+
+    location ~ ^/api/posts/([^/]+)/comments {
+        proxy_pass http://comments_active/posts/$1/comments$is_args$args;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+    }
+
+    location /api/comments/ {
+        rewrite ^/api/comments/(.*) /$1 break;
+        proxy_pass http://comments_active;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+        proxy_next_upstream error timeout http_502 http_503;
+    }
+
+    location /api/media/ {
+        rewrite ^/api/media/(.*) /$1 break;
+        proxy_pass http://media_active;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+        client_max_body_size 12M;
+        proxy_next_upstream error timeout http_502 http_503;
+    }
+
+    location /api/notifications/ {
+        rewrite ^/api/notifications/(.*) /$1 break;
+        proxy_pass http://notification_worker_active;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}

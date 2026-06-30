@@ -1,0 +1,71 @@
+name: Blue-Green Deploy (triggered by app repo)
+
+on:
+  repository_dispatch:
+    types: [deploy-services]
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Comma-separated services to deploy (e.g. posts,comments)'
+        required: true
+        default: 'auth,posts,comments,media,notification-worker'
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        default: 'latest'
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve deploy parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "image_tag=${{ github.event.client_payload.image_tag }}" >> "$GITHUB_OUTPUT"
+            SERVICES=$(echo '${{ toJson(github.event.client_payload.services) }}' | jq -r 'join(",")')
+            echo "services=${SERVICES}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "services=${{ github.event.inputs.services }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Sync deploy scripts to server
+        run: |
+          scp -i ~/.ssh/id_rsa scripts/deploy-service.sh scripts/deploy-all.sh \
+            ubuntu@${{ secrets.EC2_HOST }}:/opt/blogify/
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} \
+            "chmod +x /opt/blogify/deploy-service.sh /opt/blogify/deploy-all.sh"
+
+      - name: Run blue-green deployment
+        run: |
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} \
+            "sudo JWT_SECRET='${{ secrets.JWT_SECRET }}' /opt/blogify/deploy-all.sh \
+              '${{ secrets.DOCKERHUB_USERNAME }}' \
+              '${{ steps.params.outputs.image_tag }}' \
+              '${{ steps.params.outputs.services }}'"
+
+      - name: Verify gateway health
+        run: |
+          sleep 5
+          curl -sf "http://${{ secrets.EC2_HOST }}/nginx-health" || exit 1
+          echo "Gateway healthy."
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Blue-Green Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Services: ${{ steps.params.outputs.services }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image tag: ${{ steps.params.outputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Triggered by: ${{ github.event.client_payload.triggered_by || github.actor }}" >> "$GITHUB_STEP_SUMMARY"

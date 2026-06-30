@@ -1,0 +1,204 @@
+---
+- name: Configure Blogify server (data layer + blue-green gateway)
+  hosts: blogify_server
+  become: true
+
+  vars:
+    docker_namespace: "{{ lookup('env', 'DOCKERHUB_NAMESPACE') | default('sufiyanbader', true) }}"
+    app_version: "latest"
+    nginx_conf_dir: "/etc/nginx/conf.d"
+    deploy_dir: "/opt/blogify"
+    jwt_secret: "{{ lookup('env', 'JWT_SECRET') | default('change-this-in-prod', true) }}"
+    services:
+      - { name: auth, port_blue: 4101, port_green: 4102 }
+      - { name: posts, port_blue: 4201, port_green: 4202 }
+      - { name: comments, port_blue: 4301, port_green: 4302 }
+      - { name: media, port_blue: 4401, port_green: 4402 }
+      - { name: notification-worker, port_blue: 4501, port_green: 4502 }
+
+  tasks:
+
+    # ---- Base packages -------------------------------------------------
+    - name: Update apt cache
+      apt: { update_cache: yes, cache_valid_time: 3600 }
+
+    - name: Install required packages
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, gnupg, lsb-release, python3-pip, git]
+        state: present
+
+    # ---- Docker -----------------------------------------------------------
+    - name: Add Docker GPG key
+      apt_key: { url: "https://download.docker.com/linux/ubuntu/gpg", state: present }
+
+    - name: Add Docker repo
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker CE
+      apt:
+        name: [docker-ce, docker-ce-cli, containerd.io]
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker
+      systemd: { name: docker, state: started, enabled: yes }
+
+    - name: Add ubuntu user to docker group
+      user: { name: ubuntu, groups: docker, append: yes }
+
+    - name: Install python docker SDK (required by docker_container module)
+      pip: { name: docker, state: present }
+
+    # ---- Nginx ---------------------------------------------------------
+    - name: Install Nginx
+      apt: { name: nginx, state: present }
+
+    - name: Start and enable Nginx
+      systemd: { name: nginx, state: started, enabled: yes }
+
+    - name: Remove default Nginx site
+      file: { path: /etc/nginx/sites-enabled/default, state: absent }
+
+    # ---- Deploy directory & docker network -----------------------------
+    - name: Create deploy directory
+      file: { path: "{{ deploy_dir }}", state: directory, mode: '0755' }
+
+    - name: Create shared docker network
+      docker_network:
+        name: blogify
+        state: present
+
+    # ---- Data layer (single instances, shared by blue+green app containers) --
+    - name: Start Postgres
+      docker_container:
+        name: blogify-postgres
+        image: postgres:16-alpine
+        state: started
+        restart_policy: unless-stopped
+        networks: [{ name: blogify }]
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_USER: blogify
+          POSTGRES_PASSWORD: blogify
+          POSTGRES_DB: blogify
+        volumes: ["/var/data/postgres:/var/lib/postgresql/data"]
+
+    - name: Start Redis
+      docker_container:
+        name: blogify-redis
+        image: redis:7-alpine
+        state: started
+        restart_policy: unless-stopped
+        networks: [{ name: blogify }]
+        volumes: ["/var/data/redis:/data"]
+
+    - name: Start RabbitMQ
+      docker_container:
+        name: blogify-rabbitmq
+        image: rabbitmq:3.13-management-alpine
+        state: started
+        restart_policy: unless-stopped
+        networks: [{ name: blogify }]
+        ports: ["15672:15672"]
+        env: { RABBITMQ_DEFAULT_USER: blogify, RABBITMQ_DEFAULT_PASS: blogify }
+        volumes: ["/var/data/rabbitmq:/var/lib/rabbitmq"]
+
+    - name: Start MinIO
+      docker_container:
+        name: blogify-minio
+        image: minio/minio:latest
+        state: started
+        restart_policy: unless-stopped
+        networks: [{ name: blogify }]
+        ports: ["9000:9000", "9001:9001"]
+        command: "server /data --console-address \":9001\""
+        env: { MINIO_ROOT_USER: blogify, MINIO_ROOT_PASSWORD: blogify123 }
+        volumes: ["/var/data/minio:/data"]
+
+    - name: Wait for Postgres to accept connections
+      wait_for: { host: 127.0.0.1, port: 5432, delay: 5, timeout: 60 }
+
+    - name: Wait for RabbitMQ to accept connections
+      wait_for: { host: 127.0.0.1, port: 5672, delay: 5, timeout: 90 }
+
+    # ---- Blue-green Nginx upstream configs (one pair per service) --------
+    - name: Write blue upstream config for each service
+      copy:
+        dest: "{{ nginx_conf_dir }}/{{ item.name }}-blue.conf"
+        content: |
+          upstream {{ item.name | replace('-', '_') }}_active {
+              server 127.0.0.1:{{ item.port_blue }};
+          }
+      loop: "{{ services }}"
+
+    - name: Write green upstream config for each service
+      copy:
+        dest: "{{ nginx_conf_dir }}/{{ item.name }}-green.conf"
+        content: |
+          upstream {{ item.name | replace('-', '_') }}_active {
+              server 127.0.0.1:{{ item.port_green }};
+          }
+      loop: "{{ services }}"
+
+    - name: Set initial active upstream to blue for each service
+      copy:
+        dest: "{{ nginx_conf_dir }}/{{ item.name }}-active.conf"
+        content: |
+          upstream {{ item.name | replace('-', '_') }}_active {
+              server 127.0.0.1:{{ item.port_blue }};
+          }
+      loop: "{{ services }}"
+
+    # ---- Gateway server block: routes /api/<service>/ to that service's active upstream --
+    - name: Copy gateway Nginx config
+      template:
+        src: ../nginx/gateway.conf.j2
+        dest: "{{ nginx_conf_dir }}/gateway.conf"
+
+    - name: Test Nginx config
+      command: nginx -t
+      changed_when: false
+
+    - name: Reload Nginx
+      systemd: { name: nginx, state: reloaded }
+
+    # ---- Deploy script ---------------------------------------------------
+    - name: Copy blue-green deploy script
+      copy:
+        src: ../scripts/deploy-service.sh
+        dest: "{{ deploy_dir }}/deploy-service.sh"
+        mode: '0755'
+
+    # ---- Initial deployment: start every service in its blue slot --------
+    - name: Pull initial images
+      docker_image:
+        name: "{{ docker_namespace }}/blogify-{{ item.name }}:{{ app_version }}"
+        source: pull
+      loop: "{{ services }}"
+
+    - name: Start each service in its blue slot
+      docker_container:
+        name: "blogify-{{ item.name }}-blue"
+        image: "{{ docker_namespace }}/blogify-{{ item.name }}:{{ app_version }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        env:
+          PORT: "{{ item.port_blue | string }}"
+          APP_VERSION: "{{ app_version }}"
+          DATABASE_URL: "postgresql://blogify:blogify@127.0.0.1:5432/blogify"
+          REDIS_URL: "redis://127.0.0.1:6379"
+          RABBITMQ_URL: "amqp://blogify:blogify@127.0.0.1:5672"
+          MINIO_ENDPOINT: "127.0.0.1"
+          MINIO_PORT: "9000"
+          MINIO_ACCESS_KEY: "blogify"
+          MINIO_SECRET_KEY: "blogify123"
+          MEDIA_PUBLIC_URL: "http://{{ ansible_host }}:9000"
+          JWT_SECRET: "{{ jwt_secret }}"
+      loop: "{{ services }}"
+
+    - name: Show completion message
+      debug:
+        msg: "Blogify deployed. All 5 services live on blue slots, routed through Nginx gateway on port 80."

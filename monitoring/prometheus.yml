@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs: [{ targets: ['localhost:9090'] }]
+
+  - job_name: 'node-exporter'
+    static_configs: [{ targets: ['localhost:9100'] }]
+
+  - job_name: 'cadvisor'
+    static_configs: [{ targets: ['localhost:8080'] }]
+
+  # All services expose /health — scraped here as an uptime probe per slot.
+  # (For real metrics you'd add prom-client to each service and expose /metrics;
+  #  this config gives you blue vs green liveness comparison out of the box.)
+  - job_name: 'blogify-services'
+    metrics_path: /health
+    static_configs:
+      - targets:
+          - 'localhost:4101'  # auth blue
+          - 'localhost:4102'  # auth green
+          - 'localhost:4201'  # posts blue
+          - 'localhost:4202'  # posts green
+          - 'localhost:4301'  # comments blue
+          - 'localhost:4302'  # comments green
+          - 'localhost:4401'  # media blue
+          - 'localhost:4402'  # media green
+          - 'localhost:4501'  # notification-worker blue
+          - 'localhost:4502'  # notification-worker green
