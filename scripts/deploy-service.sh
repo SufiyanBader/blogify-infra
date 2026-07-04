@@ -7,8 +7,8 @@ PORT_BLUE=$3
 PORT_GREEN=$4
 
 GATEWAY_CONF="/etc/nginx/conf.d/gateway.conf"
-HEALTH_RETRIES=10
-HEALTH_WAIT=5
+HEALTH_RETRIES=20
+HEALTH_WAIT=8
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()     { echo -e "${NC}[$(date '+%H:%M:%S')] [$SERVICE] $*"; }
@@ -116,4 +116,3 @@ main
 SCRIPT
 
 sudo chmod +x /opt/blogify/deploy-service.sh
-echo "Script updated"
