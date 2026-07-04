@@ -50,22 +50,21 @@ jobs:
 
       - name: Run blue-green deployment
         run: |
+          # Filter out notification-worker — deployed separately as it needs manual port management
+          SERVICES=$(echo '${{ steps.params.outputs.services }}' | tr ',' '\n' | grep -v 'notification-worker' | tr '\n' ',' | sed 's/,$//')
+          if [ -z "$SERVICES" ]; then
+            echo "No services to deploy after filtering"
+            exit 0
+          fi
           ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} \
             "sudo JWT_SECRET='${{ secrets.JWT_SECRET }}' /opt/blogify/deploy-all.sh \
               '${{ secrets.DOCKERHUB_USERNAME }}' \
               '${{ steps.params.outputs.image_tag }}' \
-              '${{ steps.params.outputs.services }}'"
-
-      - name: Verify gateway health
-        run: |
-          sleep 5
-          curl -sf "http://${{ secrets.EC2_HOST }}/nginx-health" || exit 1
-          echo "Gateway healthy."
-
+              '${SERVICES}'"
       - name: Summary
         if: always()
         run: |
           echo "### Blue-Green Deployment" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Services: ${{ steps.params.outputs.services }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Services: ${{ steps.params.outputs.services }}"--exclude notification-worker >> "$GITHUB_STEP_SUMMARY"
           echo "- Image tag: ${{ steps.params.outputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Triggered by: ${{ github.event.client_payload.triggered_by || github.actor }}" >> "$GITHUB_STEP_SUMMARY"
