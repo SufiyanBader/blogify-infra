@@ -1,20 +1,12 @@
 #!/bin/bash
-# =============================================================================
-# Blue-Green deployment for ONE microservice.
-# Usage: ./deploy-service.sh <service_name> <image> <port_blue> <port_green> [env_file]
-# Example:
-#   ./deploy-service.sh posts sufiyanbader/blogify-posts:abc1234 4201 4202 /opt/blogify/posts.env
-# =============================================================================
-
 set -euo pipefail
 
 SERVICE=$1
 IMAGE=$2
 PORT_BLUE=$3
 PORT_GREEN=$4
-ENV_FILE=${5:-}
 
-NGINX_CONF_DIR="/etc/nginx/conf.d"
+GATEWAY_CONF="/etc/nginx/conf.d/gateway.conf"
 HEALTH_RETRIES=10
 HEALTH_WAIT=5
 
@@ -26,13 +18,8 @@ error()   { echo -e "${RED}[$(date '+%H:%M:%S')] [$SERVICE] ✗ $*${NC}"; exit 1
 
 UPSTREAM_NAME="${SERVICE//-/_}_active"
 
-get_active_slot() {
-    local conf="${NGINX_CONF_DIR}/${SERVICE}-active.conf"
-    if [ -f "$conf" ] && grep -q "${PORT_BLUE}" "$conf"; then
-        echo "blue"
-    else
-        echo "green"
-    fi
+get_active_port() {
+    grep -A1 "upstream ${UPSTREAM_NAME}" $GATEWAY_CONF | grep server | grep -oP ':\K[0-9]+' | head -1
 }
 
 health_check() {
@@ -53,10 +40,11 @@ health_check() {
 
 main() {
     log "Deploying image: ${IMAGE}"
-    ACTIVE=$(get_active_slot)
-    log "Current active slot: ${ACTIVE}"
 
-    if [ "${ACTIVE}" = "blue" ]; then
+    CURRENT_PORT=$(get_active_port)
+    log "Current active port: ${CURRENT_PORT}"
+
+    if [ "$CURRENT_PORT" = "$PORT_BLUE" ]; then
         NEW_SLOT="green"; NEW_PORT=$PORT_GREEN
         OLD_SLOT="blue";  OLD_PORT=$PORT_BLUE
     else
@@ -69,68 +57,63 @@ main() {
     log "Pulling ${IMAGE}..."
     docker pull "${IMAGE}" || error "Image pull failed"
 
-    CONTAINER_NAME="blogify-${SERVICE}-${NEW_SLOT}"
-    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        log "Removing stale ${NEW_SLOT} container..."
-        docker stop "${CONTAINER_NAME}" 2>/dev/null || true
-        docker rm   "${CONTAINER_NAME}" 2>/dev/null || true
-    fi
+    CONTAINER="blogify-${SERVICE}-${NEW_SLOT}"
+    docker stop "${CONTAINER}" 2>/dev/null || true
+    docker rm   "${CONTAINER}" 2>/dev/null || true
 
-    log "Starting ${CONTAINER_NAME} on port ${NEW_PORT}..."
-
-    ENV_ARGS=(
-        -e "PORT=${NEW_PORT}"
-        -e "APP_VERSION=${IMAGE##*:}"
-        -e "DATABASE_URL=postgresql://blogify:blogify@127.0.0.1:5432/blogify"
-        -e "REDIS_URL=redis://127.0.0.1:6379"
-        -e "RABBITMQ_URL=amqp://blogify:blogify@127.0.0.1:5672"
-        -e "MINIO_ENDPOINT=127.0.0.1"
-        -e "MINIO_PORT=9000"
-        -e "MINIO_ACCESS_KEY=blogify"
-        -e "MINIO_SECRET_KEY=blogify123"
-        -e "JWT_SECRET=${JWT_SECRET:-change-this-in-prod}"
-    )
-
+    log "Starting ${CONTAINER} on port ${NEW_PORT}..."
     docker run -d \
-        --name "${CONTAINER_NAME}" \
+        --name "${CONTAINER}" \
         --restart unless-stopped \
         --network host \
-        "${ENV_ARGS[@]}" \
-        "${IMAGE}" || error "Failed to start ${NEW_SLOT} container"
+        -e PORT="${NEW_PORT}" \
+        -e APP_VERSION="${IMAGE##*:}" \
+        -e DATABASE_URL="postgresql://blogify:blogify@127.0.0.1:5432/blogify" \
+        -e REDIS_URL="redis://127.0.0.1:6379" \
+        -e RABBITMQ_URL="amqp://blogify:blogify@127.0.0.1:5672" \
+        -e MINIO_ENDPOINT="127.0.0.1" \
+        -e MINIO_PORT="9000" \
+        -e MINIO_ACCESS_KEY="blogify" \
+        -e MINIO_SECRET_KEY="blogify123" \
+        -e JWT_SECRET="${JWT_SECRET:-dev-secret-change-in-prod}" \
+        "${IMAGE}" || error "Failed to start container"
 
     if ! health_check "${NEW_PORT}"; then
-        warn "New ${NEW_SLOT} container failed health checks — stopping it, keeping ${OLD_SLOT} live"
-        docker stop "${CONTAINER_NAME}" 2>/dev/null || true
-        error "Deployment aborted for ${SERVICE} — rolled back to ${OLD_SLOT}"
+        docker stop "${CONTAINER}" 2>/dev/null || true
+        error "Health check failed — keeping ${OLD_SLOT} active"
     fi
 
-    log "Switching ${SERVICE} upstream to ${NEW_SLOT}..."
-    cp "${NGINX_CONF_DIR}/${SERVICE}-${NEW_SLOT}.conf" "${NGINX_CONF_DIR}/${SERVICE}-active.conf"
+    log "Switching ${SERVICE} upstream to port ${NEW_PORT}..."
+    sed -i "s|upstream ${UPSTREAM_NAME} { server 127.0.0.1:${OLD_PORT}; }|upstream ${UPSTREAM_NAME} { server 127.0.0.1:${NEW_PORT}; }|" $GATEWAY_CONF
 
-    nginx -t || error "Nginx config test failed — not reloading"
+    nginx -t || error "Nginx config test failed"
     nginx -s reload
-    success "Nginx reloaded — ${SERVICE} traffic now on ${NEW_SLOT} (port ${NEW_PORT})"
+    success "Nginx reloaded — ${SERVICE} now on ${NEW_SLOT} (port ${NEW_PORT})"
 
     sleep 2
     if curl -sf "http://127.0.0.1/api/${SERVICE}/health" > /dev/null 2>&1; then
-        success "End-to-end check passed via gateway"
+        success "End-to-end check passed"
     else
-        warn "End-to-end check failed — reverting ${SERVICE} to ${OLD_SLOT}"
-        cp "${NGINX_CONF_DIR}/${SERVICE}-${OLD_SLOT}.conf" "${NGINX_CONF_DIR}/${SERVICE}-active.conf"
+        warn "End-to-end check failed — reverting"
+        sed -i "s|upstream ${UPSTREAM_NAME} { server 127.0.0.1:${NEW_PORT}; }|upstream ${UPSTREAM_NAME} { server 127.0.0.1:${OLD_PORT}; }|" $GATEWAY_CONF
         nginx -s reload
-        docker stop "${CONTAINER_NAME}" 2>/dev/null || true
-        error "Deployment failed for ${SERVICE} — ${OLD_SLOT} remains active"
+        docker stop "${CONTAINER}" || true
+        error "Deployment failed — ${OLD_SLOT} restored"
     fi
 
     OLD_CONTAINER="blogify-${SERVICE}-${OLD_SLOT}"
     if docker ps --format '{{.Names}}' | grep -q "^${OLD_CONTAINER}$"; then
-        log "Waiting 20s before stopping old ${OLD_SLOT} container..."
-        sleep 20
+        log "Stopping old ${OLD_SLOT} container in 10s..."
+        sleep 10
         docker stop "${OLD_CONTAINER}" || true
         success "Old ${OLD_SLOT} container stopped"
     fi
 
-    success "=== ${SERVICE} deployment complete: ${NEW_SLOT} @ ${NEW_PORT} ==="
+    success "=== ${SERVICE} deployed to ${NEW_SLOT} @ port ${NEW_PORT} ==="
 }
 
 main
+SCRIPT
+
+sudo chmod +x /opt/blogify/deploy-service.sh
+echo "Script updated"
