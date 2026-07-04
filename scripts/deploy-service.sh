@@ -113,6 +113,4 @@ main() {
 }
 
 main
-SCRIPT
 
-sudo chmod +x /opt/blogify/deploy-service.sh
